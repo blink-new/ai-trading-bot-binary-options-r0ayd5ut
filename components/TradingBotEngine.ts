@@ -1,4 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { MLModelTraining, TrainingData, TrainingMetrics } from './MLModelTraining';
+import { DataCollection, SentimentAnalysis, EconomicData } from './DataCollection';
 
 export interface MarketData {
   symbol: string;
@@ -66,13 +68,333 @@ export class TradingBotEngine {
   private marketData: Map<string, MarketData[]> = new Map();
   private modelWeights: Map<string, number[]> = new Map();
   private historicalPredictions: Map<string, any[]> = new Map();
+  private mlModels: Map<string, MLModelTraining> = new Map();
+  private dataCollection: DataCollection;
+  private isTraining: boolean = false;
 
   constructor() {
+    this.dataCollection = new DataCollection();
     this.initializeModels();
+    this.initializeMLModels();
   }
 
-  // Data Collection - Real-time and Historical Market Data
-  async fetchRealTimeData(symbol: string): Promise<MarketData | null> {
+  private async initializeMLModels(): Promise<void> {
+    for (const symbol of this.getSupportedSymbols()) {
+      const mlModel = new MLModelTraining(symbol, {
+        inputSize: 18, // Increased to include sentiment and economic data
+        hiddenLayers: [64, 32, 16],
+        learningRate: 0.001,
+        epochs: 150,
+        batchSize: 64
+      });
+      
+      // Try to load existing model
+      await mlModel.loadModel();
+      this.mlModels.set(symbol, mlModel);
+    }
+  }
+
+  private async extractEnhancedFeatures(
+    marketData: MarketData[], 
+    indicators: TechnicalIndicators,
+    symbol: string
+  ): Promise<number[]> {
+    if (marketData.length === 0) return new Array(18).fill(0);
+    
+    const latest = marketData[marketData.length - 1];
+    
+    // Get sentiment data
+    const sentiment = await this.dataCollection.calculateSentimentAnalysis(symbol);
+    
+    // Get upcoming economic events
+    const currency1 = symbol.substring(0, 3);
+    const currency2 = symbol.substring(3, 6);
+    const upcomingEvents1 = this.dataCollection.getUpcomingEvents(currency1, 3);
+    const upcomingEvents2 = this.dataCollection.getUpcomingEvents(currency2, 3);
+    
+    // Calculate economic impact score
+    const economicImpact1 = this.calculateEconomicImpact(upcomingEvents1);
+    const economicImpact2 = this.calculateEconomicImpact(upcomingEvents2);
+    
+    // Original technical features (normalized)
+    const technicalFeatures = this.normalizeData([
+      indicators.rsi,
+      indicators.macd.macd * 1000, // Scale MACD
+      indicators.bollingerBands.upper,
+      indicators.bollingerBands.middle,
+      indicators.bollingerBands.lower,
+      indicators.sma20,
+      indicators.sma50,
+      indicators.ema12,
+      indicators.ema26,
+      indicators.stochastic.k,
+      indicators.stochastic.d,
+      indicators.volatility * 100,
+      latest.changePercent,
+      (latest.price - indicators.support) / indicators.support,
+      (indicators.resistance - latest.price) / latest.price
+    ]);
+    
+    // Add sentiment and economic features
+    const enhancedFeatures = [
+      ...technicalFeatures,
+      (sentiment.overallSentiment + 1) / 2, // Normalize to 0-1
+      sentiment.fearGreedIndex / 100,
+      economicImpact1 / 10, // Normalize economic impact
+      economicImpact2 / 10
+    ];
+    
+    return enhancedFeatures;
+  }
+
+  private calculateEconomicImpact(events: EconomicData[]): number {
+    let totalImpact = 0;
+    
+    for (const event of events) {
+      let impact = 0;
+      switch (event.impact) {
+        case 'high':
+          impact = 3;
+          break;
+        case 'medium':
+          impact = 2;
+          break;
+        case 'low':
+          impact = 1;
+          break;
+      }
+      
+      // Weight by how soon the event is
+      const daysUntil = (event.timestamp - Date.now()) / (24 * 60 * 60 * 1000);
+      const timeWeight = Math.max(0, 1 - daysUntil / 7); // Closer events have more impact
+      
+      totalImpact += impact * timeWeight;
+    }
+    
+    return totalImpact;
+  }
+
+  async generateTradingSignal(symbol: string, duration: 1 | 3 | 5): Promise<TradingSignal | null> {
+    try {
+      // Get historical data
+      const historicalData = await this.fetchHistoricalData(symbol + '=X');
+      if (historicalData.length === 0) return null;
+      
+      // Get real-time data
+      const currentData = await this.fetchRealTimeData(symbol + '=X');
+      if (!currentData) return null;
+      
+      // Calculate technical indicators
+      const indicators = this.calculateTechnicalIndicators([...historicalData, currentData]);
+      
+      // Get ML model for this symbol
+      const mlModel = this.mlModels.get(symbol);
+      if (!mlModel) return null;
+      
+      // Extract enhanced features
+      const features = await this.extractEnhancedFeatures([...historicalData, currentData], indicators, symbol);
+      
+      // Get ML prediction
+      const mlPrediction = mlModel.predict(features);
+      
+      // Get sentiment analysis
+      const sentiment = await this.dataCollection.calculateSentimentAnalysis(symbol);
+      
+      // Rule-based analysis
+      const ruleBasedSignals = this.analyzeRuleBasedSignals(indicators, currentData);
+      
+      // Enhanced signal combination with sentiment
+      const sentimentWeight = Math.abs(sentiment.overallSentiment) * 0.1; // 0-10% weight
+      const mlWeight = 0.6 - sentimentWeight;
+      const ruleWeight = 0.4;
+      
+      const combinedConfidence = (mlPrediction * mlWeight) + 
+                               (ruleBasedSignals.confidence * ruleWeight) + 
+                               (sentiment.overallSentiment > 0 ? sentimentWeight : -sentimentWeight);
+      
+      // Determine direction with higher threshold
+      let direction: 'CALL' | 'PUT';
+      let reasoning: string[] = [];
+      
+      if (combinedConfidence > 0.65) {
+        direction = 'CALL';
+        reasoning.push(`Strong bullish signal (${(combinedConfidence * 100).toFixed(1)}% confidence)`);
+      } else if (combinedConfidence < 0.35) {
+        direction = 'PUT';
+        reasoning.push(`Strong bearish signal (${((1 - combinedConfidence) * 100).toFixed(1)}% confidence)`);
+      } else {
+        return null; // No clear signal
+      }
+      
+      // Add sentiment reasoning
+      if (Math.abs(sentiment.overallSentiment) > 0.3) {
+        reasoning.push(`Market sentiment: ${sentiment.overallSentiment > 0 ? 'Positive' : 'Negative'} (${(Math.abs(sentiment.overallSentiment) * 100).toFixed(1)}%)`);
+      }
+      
+      // Add technical analysis reasoning
+      reasoning.push(...ruleBasedSignals.reasoning);
+      
+      // Add economic calendar impact
+      const currency1 = symbol.substring(0, 3);
+      const currency2 = symbol.substring(3, 6);
+      const upcomingEvents = [
+        ...this.dataCollection.getUpcomingEvents(currency1, 1),
+        ...this.dataCollection.getUpcomingEvents(currency2, 1)
+      ];
+      
+      if (upcomingEvents.length > 0) {
+        reasoning.push(`${upcomingEvents.length} economic event(s) in next 24h may impact price`);
+      }
+      
+      // Enhanced risk calculations
+      const volatilityAdjustment = indicators.volatility * currentData.price * 0.015;
+      const sentimentAdjustment = Math.abs(sentiment.overallSentiment) * currentData.price * 0.005;
+      
+      const stopLoss = direction === 'CALL' 
+        ? currentData.price - (volatilityAdjustment + sentimentAdjustment)
+        : currentData.price + (volatilityAdjustment + sentimentAdjustment);
+      
+      const takeProfit = direction === 'CALL'
+        ? currentData.price + (volatilityAdjustment * 2.5)
+        : currentData.price - (volatilityAdjustment * 2.5);
+      
+      const signal: TradingSignal = {
+        symbol: currentData.symbol,
+        direction,
+        confidence: Math.abs(combinedConfidence - 0.5) * 2, // Convert to 0-1 scale
+        duration,
+        entryPrice: currentData.price,
+        stopLoss,
+        takeProfit,
+        timestamp: Date.now(),
+        reasoning,
+        technicalIndicators: indicators
+      };
+      
+      // Store prediction for continuous learning
+      this.storePrediction(symbol, signal, features);
+      
+      return signal;
+    } catch (error) {
+      console.error(`Error generating enhanced signal for ${symbol}:`, error);
+      return null;
+    }
+  }
+
+  public async trainModels(symbol?: string): Promise<{ [symbol: string]: TrainingMetrics[] }> {
+    if (this.isTraining) {
+      throw new Error('Training already in progress');
+    }
+    
+    this.isTraining = true;
+    const results: { [symbol: string]: TrainingMetrics[] } = {};
+    
+    try {
+      const symbolsToTrain = symbol ? [symbol] : this.getSupportedSymbols();
+      
+      for (const sym of symbolsToTrain) {
+        console.log(`Training model for ${sym}...`);
+        
+        // Get extended historical data for training
+        const historicalData = await this.fetchHistoricalData(sym + '=X', '1y');
+        if (historicalData.length < 100) {
+          console.warn(`Insufficient data for ${sym}, skipping training`);
+          continue;
+        }
+        
+        // Calculate indicators for all historical data
+        const indicatorsHistory: TechnicalIndicators[] = [];
+        for (let i = 20; i < historicalData.length; i++) {
+          const dataSlice = historicalData.slice(0, i + 1);
+          const indicators = this.calculateTechnicalIndicators(dataSlice);
+          indicatorsHistory.push(indicators);
+        }
+        
+        // Prepare training data
+        const trainingData = MLModelTraining.prepareTrainingData(
+          historicalData.slice(20), // Skip first 20 for indicator calculation
+          indicatorsHistory
+        );
+        
+        // Get ML model and train
+        const mlModel = this.mlModels.get(sym);
+        if (mlModel && trainingData.length > 50) {
+          const metrics = await mlModel.trainModel(trainingData);
+          results[sym] = metrics;
+          console.log(`Training completed for ${sym}`);
+        }
+      }
+    } catch (error) {
+      console.error('Error during model training:', error);
+    } finally {
+      this.isTraining = false;
+    }
+    
+    return results;
+  }
+
+  public isModelTraining(): boolean {
+    return this.isTraining;
+  }
+
+  public getMLModelPerformance(symbol: string): TrainingMetrics | null {
+    const model = this.mlModels.get(symbol);
+    return model ? model.getPerformanceMetrics() : null;
+  }
+
+  public async getSentimentAnalysis(symbol: string): Promise<SentimentAnalysis> {
+    return await this.dataCollection.calculateSentimentAnalysis(symbol);
+  }
+
+  public getUpcomingEconomicEvents(days: number = 7): EconomicData[] {
+    return this.dataCollection.getHighImpactEvents(days);
+  }
+
+  public getMarketMood(): { mood: string; score: number; description: string } {
+    return this.dataCollection.getMarketMoodIndicator();
+  }
+
+  public async autoRetrainModels(): Promise<void> {
+    try {
+      // Check if enough new data has been collected
+      for (const symbol of this.getSupportedSymbols()) {
+        const lastTraining = await AsyncStorage.getItem(`last_training_${symbol}`);
+        const lastTrainingTime = lastTraining ? parseInt(lastTraining) : 0;
+        const daysSinceTraining = (Date.now() - lastTrainingTime) / (24 * 60 * 60 * 1000);
+        
+        // Retrain if it's been more than 7 days
+        if (daysSinceTraining > 7) {
+          console.log(`Auto-retraining model for ${symbol}`);
+          await this.trainModels(symbol);
+          await AsyncStorage.setItem(`last_training_${symbol}`, Date.now().toString());
+        }
+      }
+    } catch (error) {
+      console.error('Error during auto-retraining:', error);
+    }
+  }
+
+  public async cleanOldData(days: number = 30): Promise<void> {
+    try {
+      await this.dataCollection.cleanOldData(days);
+      
+      // Clean old predictions
+      for (const symbol of this.getSupportedSymbols()) {
+        const key = `predictions_${symbol}`;
+        const existing = await AsyncStorage.getItem(key);
+        if (existing) {
+          const predictions = JSON.parse(existing);
+          const cutoffTime = Date.now() - days * 24 * 60 * 60 * 1000;
+          const filteredPredictions = predictions.filter((p: any) => p.timestamp > cutoffTime);
+          await AsyncStorage.setItem(key, JSON.stringify(filteredPredictions));
+        }
+      }
+    } catch (error) {
+      console.error('Error cleaning old data:', error);
+    }
+  }
+
+  private async fetchRealTimeData(symbol: string): Promise<MarketData | null> {
     try {
       const response = await fetch(
         `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1m&range=1d`,
@@ -116,7 +438,7 @@ export class TradingBotEngine {
     }
   }
 
-  async fetchHistoricalData(symbol: string, period: string = '3mo'): Promise<MarketData[]> {
+  private async fetchHistoricalData(symbol: string, period: string = '3mo'): Promise<MarketData[]> {
     try {
       const response = await fetch(
         `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=${period}`,
@@ -163,8 +485,7 @@ export class TradingBotEngine {
     }
   }
 
-  // Data Preprocessing
-  normalizeData(data: number[]): number[] {
+  private normalizeData(data: number[]): number[] {
     const min = Math.min(...data);
     const max = Math.max(...data);
     const range = max - min;
@@ -174,7 +495,7 @@ export class TradingBotEngine {
     return data.map(value => (value - min) / range);
   }
 
-  removeOutliers(data: number[]): number[] {
+  private removeOutliers(data: number[]): number[] {
     const sorted = [...data].sort((a, b) => a - b);
     const q1 = sorted[Math.floor(sorted.length * 0.25)];
     const q3 = sorted[Math.floor(sorted.length * 0.75)];
@@ -185,8 +506,7 @@ export class TradingBotEngine {
     return data.filter(value => value >= lowerBound && value <= upperBound);
   }
 
-  // Feature Engineering - Technical Indicators
-  calculateRSI(prices: number[], period: number = 14): number {
+  private calculateRSI(prices: number[], period: number = 14): number {
     if (prices.length < period + 1) return 50;
     
     let gains = 0;
@@ -215,7 +535,7 @@ export class TradingBotEngine {
     return 100 - (100 / (1 + rs));
   }
 
-  calculateMACD(prices: number[]): { macd: number; signal: number; histogram: number } {
+  private calculateMACD(prices: number[]): { macd: number; signal: number; histogram: number } {
     const ema12 = this.calculateEMA(prices, 12);
     const ema26 = this.calculateEMA(prices, 26);
     const macd = ema12 - ema26;
@@ -228,7 +548,7 @@ export class TradingBotEngine {
     return { macd, signal, histogram };
   }
 
-  calculateBollingerBands(prices: number[], period: number = 20, stdDev: number = 2): 
+  private calculateBollingerBands(prices: number[], period: number = 20, stdDev: number = 2): 
     { upper: number; middle: number; lower: number } {
     if (prices.length < period) {
       const lastPrice = prices[prices.length - 1];
@@ -248,13 +568,13 @@ export class TradingBotEngine {
     };
   }
 
-  calculateSMA(prices: number[], period: number): number {
+  private calculateSMA(prices: number[], period: number): number {
     if (prices.length < period) return prices[prices.length - 1] || 0;
     const recentPrices = prices.slice(-period);
     return recentPrices.reduce((sum, price) => sum + price, 0) / period;
   }
 
-  calculateEMA(prices: number[], period: number): number {
+  private calculateEMA(prices: number[], period: number): number {
     if (prices.length === 0) return 0;
     if (prices.length === 1) return prices[0];
     
@@ -268,7 +588,7 @@ export class TradingBotEngine {
     return ema;
   }
 
-  calculateStochastic(highs: number[], lows: number[], closes: number[], period: number = 14): 
+  private calculateStochastic(highs: number[], lows: number[], closes: number[], period: number = 14): 
     { k: number; d: number } {
     if (closes.length < period) {
       return { k: 50, d: 50 };
@@ -287,7 +607,7 @@ export class TradingBotEngine {
     return { k, d };
   }
 
-  calculateVolatility(prices: number[], period: number = 20): number {
+  private calculateVolatility(prices: number[], period: number = 20): number {
     if (prices.length < period) return 0;
     
     const returns = [];
@@ -301,7 +621,7 @@ export class TradingBotEngine {
     return Math.sqrt(variance) * Math.sqrt(252); // Annualized volatility
   }
 
-  calculateSupportResistance(highs: number[], lows: number[], period: number = 20): 
+  private calculateSupportResistance(highs: number[], lows: number[], period: number = 20): 
     { support: number; resistance: number } {
     if (highs.length < period || lows.length < period) {
       const lastHigh = highs[highs.length - 1] || 0;
@@ -319,8 +639,7 @@ export class TradingBotEngine {
     return { support, resistance };
   }
 
-  // Calculate all technical indicators
-  calculateTechnicalIndicators(marketData: MarketData[]): TechnicalIndicators {
+  private calculateTechnicalIndicators(marketData: MarketData[]): TechnicalIndicators {
     if (marketData.length === 0) {
       return {
         rsi: 50,
@@ -357,39 +676,6 @@ export class TradingBotEngine {
     };
   }
 
-  // AI Model Implementation
-  private initializeModels(): void {
-    // Initialize neural network weights for each symbol
-    this.symbols.forEach(symbol => {
-      // Simple feedforward neural network weights
-      const inputSize = 15; // Number of features
-      const hiddenSize = 32;
-      const outputSize = 1;
-      
-      const weights: number[] = [];
-      
-      // Input to hidden layer weights
-      for (let i = 0; i < inputSize * hiddenSize; i++) {
-        weights.push((Math.random() - 0.5) * 2);
-      }
-      
-      // Hidden layer bias
-      for (let i = 0; i < hiddenSize; i++) {
-        weights.push((Math.random() - 0.5) * 2);
-      }
-      
-      // Hidden to output layer weights
-      for (let i = 0; i < hiddenSize * outputSize; i++) {
-        weights.push((Math.random() - 0.5) * 2);
-      }
-      
-      // Output bias
-      weights.push((Math.random() - 0.5) * 2);
-      
-      this.modelWeights.set(symbol, weights);
-    });
-  }
-
   private sigmoid(x: number): number {
     return 1 / (1 + Math.exp(-x));
   }
@@ -398,7 +684,6 @@ export class TradingBotEngine {
     return Math.max(0, x);
   }
 
-  // Neural Network Forward Pass
   private neuralNetworkPredict(features: number[], symbol: string): number {
     const weights = this.modelWeights.get(symbol);
     if (!weights) return 0.5;
@@ -427,7 +712,6 @@ export class TradingBotEngine {
     return this.sigmoid(output);
   }
 
-  // Feature extraction for ML model
   private extractFeatures(marketData: MarketData[], indicators: TechnicalIndicators): number[] {
     if (marketData.length === 0) return new Array(15).fill(0);
     
@@ -451,82 +735,6 @@ export class TradingBotEngine {
     ]);
     
     return normalized;
-  }
-
-  // Signal Generation
-  async generateTradingSignal(symbol: string, duration: 1 | 3 | 5): Promise<TradingSignal | null> {
-    try {
-      // Get historical data
-      const historicalData = await this.fetchHistoricalData(symbol);
-      if (historicalData.length === 0) return null;
-      
-      // Get real-time data
-      const currentData = await this.fetchRealTimeData(symbol);
-      if (!currentData) return null;
-      
-      // Calculate technical indicators
-      const indicators = this.calculateTechnicalIndicators([...historicalData, currentData]);
-      
-      // Extract features for ML model
-      const features = this.extractFeatures([...historicalData, currentData], indicators);
-      
-      // Get ML prediction
-      const mlPrediction = this.neuralNetworkPredict(features, symbol);
-      
-      // Rule-based analysis
-      const ruleBasedSignals = this.analyzeRuleBasedSignals(indicators, currentData);
-      
-      // Combine ML and rule-based analysis
-      const combinedConfidence = (mlPrediction * 0.6) + (ruleBasedSignals.confidence * 0.4);
-      
-      // Determine direction
-      let direction: 'CALL' | 'PUT';
-      let reasoning: string[] = [];
-      
-      if (combinedConfidence > 0.6) {
-        direction = 'CALL';
-        reasoning.push(`Strong bullish signal (${(combinedConfidence * 100).toFixed(1)}% confidence)`);
-      } else if (combinedConfidence < 0.4) {
-        direction = 'PUT';
-        reasoning.push(`Strong bearish signal (${((1 - combinedConfidence) * 100).toFixed(1)}% confidence)`);
-      } else {
-        return null; // No clear signal
-      }
-      
-      // Add technical analysis reasoning
-      reasoning.push(...ruleBasedSignals.reasoning);
-      
-      // Calculate stop loss and take profit
-      const volatilityAdjustment = indicators.volatility * currentData.price * 0.01;
-      const stopLoss = direction === 'CALL' 
-        ? currentData.price - volatilityAdjustment
-        : currentData.price + volatilityAdjustment;
-      
-      const takeProfit = direction === 'CALL'
-        ? currentData.price + (volatilityAdjustment * 2)
-        : currentData.price - (volatilityAdjustment * 2);
-      
-      const signal: TradingSignal = {
-        symbol: currentData.symbol,
-        direction,
-        confidence: Math.abs(combinedConfidence - 0.5) * 2, // Convert to 0-1 scale
-        duration,
-        entryPrice: currentData.price,
-        stopLoss,
-        takeProfit,
-        timestamp: Date.now(),
-        reasoning,
-        technicalIndicators: indicators
-      };
-      
-      // Store prediction for continuous learning
-      this.storePrediction(symbol, signal, features);
-      
-      return signal;
-    } catch (error) {
-      console.error(`Error generating signal for ${symbol}:`, error);
-      return null;
-    }
   }
 
   private analyzeRuleBasedSignals(indicators: TechnicalIndicators, currentData: MarketData): 
@@ -598,7 +806,6 @@ export class TradingBotEngine {
     return { confidence, reasoning };
   }
 
-  // Continuous Learning
   private async storePrediction(symbol: string, signal: TradingSignal, features: number[]): Promise<void> {
     try {
       const key = `predictions_${symbol}`;
@@ -625,8 +832,7 @@ export class TradingBotEngine {
     }
   }
 
-  // Model Evaluation
-  async evaluateModel(symbol: string): Promise<ModelMetrics> {
+  public async evaluateModel(symbol: string): Promise<ModelMetrics> {
     try {
       const key = `predictions_${symbol}`;
       const stored = await AsyncStorage.getItem(key);
@@ -722,18 +928,38 @@ export class TradingBotEngine {
     }
   }
 
-  // Get all supported symbols
-  getSupportedSymbols(): string[] {
+  public getSupportedSymbols(): string[] {
     return this.symbols.map(symbol => symbol.replace('=X', ''));
   }
 
-  // Get market data for symbol
-  async getMarketData(symbol: string): Promise<MarketData | null> {
+  public async getMarketData(symbol: string): Promise<MarketData | null> {
     return await this.fetchRealTimeData(symbol + '=X');
   }
 
-  // Get historical market data
-  async getHistoricalData(symbol: string): Promise<MarketData[]> {
+  public async getHistoricalData(symbol: string): Promise<MarketData[]> {
     return await this.fetchHistoricalData(symbol + '=X');
   }
-}
+
+  private initializeModels(): void {
+    // Initialize basic neural network weights for fallback
+    this.symbols.forEach(symbol => {
+      // Simple feedforward neural network weights
+      const inputSize = 15; // Number of features
+      const hiddenSize = 32;
+      const outputSize = 1;
+      
+      const weights: number[] = [];
+      
+      // Input to hidden layer weights
+      for (let i = 0; i < inputSize * hiddenSize; i++) {
+        weights.push((Math.random() - 0.5) * 2);
+      }
+      
+      // Hidden layer bias
+      for (let i = 0; i < hiddenSize; i++) {
+        weights.push((Math.random() - 0.5) * 2);
+      }
+      
+      // Hidden to output layer weights
+      for (let i = 0; i < hiddenSize * outputSize; i++) {
+        weights.push((Math.random() - 0.5) * 
